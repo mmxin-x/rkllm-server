@@ -47,9 +47,8 @@ stream_token_queue = queue.Queue()
 @LLMResultCallback
 def api_llm_callback(result_ptr, userdata, state):
     global current_assistant_response_parts, stream_token_queue
-    # print(f"[Callback DEBUG] State: {state}, Qsize: {stream_token_queue.qsize()}") # Less verbose
+    # print(f"[Callback {threading.get_ident()}] State: {state}, Qsize: {stream_token_queue.qsize()}")
     if not result_ptr:
-        # print(f"[Callback Warning] Received NULL result_ptr. State: {state}")
         stream_token_queue.put(None) 
         return
 
@@ -58,17 +57,14 @@ def api_llm_callback(result_ptr, userdata, state):
         if result.text:
             try:
                 decoded_text = result.text.decode('utf-8', errors='replace')
-                # print(f"[Callback DEBUG] Text: '{decoded_text}'") 
                 current_assistant_response_parts.append(decoded_text) 
                 stream_token_queue.put(decoded_text)      
             except Exception as e:
                 print(f"[Callback Error] Decoding text: {e}")
                 stream_token_queue.put(None) 
     elif state == LLM_RUN_FINISH:
-        # print("[Callback DEBUG] FINISH signaled.") 
         stream_token_queue.put("__LLM_RUN_FINISH__") 
     elif state == LLM_RUN_ERROR:
-        # print("[Callback DEBUG] ERROR signaled.") 
         stream_token_queue.put(None) 
 
 def find_library_path(lib_name):
@@ -107,11 +103,11 @@ def init_rkllm_model():
     rkllm_params_global.n_keep = 32
     if rkllm_params_global.max_new_tokens == 0: rkllm_params_global.max_new_tokens = 512
     
-    # --- ATTEMPT TO ENABLE ASYNCHRONOUS MODE ---
-    rkllm_params_global.is_async = True 
+    # --- SETTING is_async TO FALSE (like manufacturer's example) ---
+    rkllm_params_global.is_async = False 
     # ---
 
-    os.environ['RKLLM_LOG_LEVEL'] = '1' # '1' for performance, '2' for more details
+    os.environ['RKLLM_LOG_LEVEL'] = '1' 
     print(f"RKLLM_LOG_LEVEL: {os.environ['RKLLM_LOG_LEVEL']}")
     print(f"Initializing model with parameters: \n"
           f"  Path: {rkllm_params_global.model_path.decode()}\n"
@@ -119,7 +115,7 @@ def init_rkllm_model():
           f"  Max New Tokens: {rkllm_params_global.max_new_tokens}\n"
           f"  N_Keep: {rkllm_params_global.n_keep}\n"
           f"  Use GPU: {rkllm_params_global.use_gpu}\n"
-          f"  Is Async: {rkllm_params_global.is_async}") # Log async setting
+          f"  Is Async (Library Flag): {rkllm_params_global.is_async}") # Log async setting
     
     ret = rkllm_lib.rkllm_init(ctypes.byref(llm_handle), ctypes.byref(rkllm_params_global), api_llm_callback)
     if ret != 0: print(f"Error: rkllm_init failed (code {ret})."); return False
@@ -137,6 +133,23 @@ def format_openai_error_response(message, err_type="invalid_request_error", para
     if code: error_obj["error"]["code"] = code
     return jsonify(error_obj)
 
+# --- Worker function to run RKLLM inference in a separate thread ---
+def rkllm_inference_worker(handle, input_obj_ptr, infer_params_obj_ptr):
+    """
+    This function will be run in a separate thread for streaming requests.
+    It calls the blocking rkllm_run. Callbacks will populate the queue.
+    """
+    thread_id = threading.get_ident()
+    print(f"[Worker {thread_id}] Starting rkllm_run. Timestamp: {time.time()}")
+    run_ret = rkllm_lib.rkllm_run(handle, input_obj_ptr, infer_params_obj_ptr, None)
+    print(f"[Worker {thread_id}] rkllm_run finished with code: {run_ret}. Timestamp: {time.time()}")
+    if run_ret != 0:
+        # If run fails, callback might not send FINISH. Put an error signal.
+        print(f"[Worker {thread_id}] rkllm_run error, ensuring error signal in queue.")
+        stream_token_queue.put(None) # Signal error to streamer
+    # The __LLM_RUN_FINISH__ or None (for error) should be put by the callback itself.
+    # This function just ensures rkllm_run is called.
+
 @app.route('/v1/chat/completions', methods=['POST'])
 def chat_completions_handler():
     global conversation_history_bytes, current_assistant_response_parts, rkllm_params_global, llm_handle, rkllm_lib, stream_token_queue
@@ -153,7 +166,8 @@ def chat_completions_handler():
     last_user_message_content = messages[-1].get("content", "")
     if not last_user_message_content.strip(): return format_openai_error_response("User content is empty.", "invalid_request_error", param="messages.content"), 400
 
-    with rkllm_lock: # Ensures only one request processes RKLLM at a time
+    # rkllm_lock ensures that context management, rkllm_run call, and history updates are atomic per request.
+    with rkllm_lock: 
         current_user_turn_bytes = USER_TURN_START + last_user_message_content.encode('utf-8') + USER_TURN_END
         prompt_for_llm = conversation_history_bytes + current_user_turn_bytes + ASSISTANT_TURN_START
         
@@ -162,7 +176,7 @@ def chat_completions_handler():
         
         if estimated_prompt_tokens > EFFECTIVE_PROMPT_TOKEN_LIMIT:
             print(f"\n[API Ctx Mgmt] Est. prompt tokens ({int(estimated_prompt_tokens)}) > limit ({EFFECTIVE_PROMPT_TOKEN_LIMIT}). Clearing KV cache.")
-            clear_ret = rkllm_lib.rkllm_clear_kv_cache(llm_handle, 1) # 1 = keep system prompt
+            clear_ret = rkllm_lib.rkllm_clear_kv_cache(llm_handle, 1) 
             if clear_ret == 0:
                 print("[API Ctx Mgmt] KV cache cleared.")
                 conversation_history_bytes = SYS_PROMPT_TEMPLATE.replace(b"{system_message}", DEFAULT_SYSTEM_MESSAGE.encode('utf-8'))
@@ -176,45 +190,53 @@ def chat_completions_handler():
             try: stream_token_queue.get_nowait()
             except queue.Empty: break
         
-        rkllm_input_obj = RKLLMInput(); rkllm_input_obj.input_type = RKLLM_INPUT_PROMPT; rkllm_input_obj.prompt_input = ctypes.c_char_p(prompt_for_llm)
-        rkllm_infer_params_obj = RKLLMInferParam(); rkllm_infer_params_obj.mode = RKLLM_INFER_GENERATE; rkllm_infer_params_obj.keep_history = 1
+        # These objects are passed to the C function, ensure they exist for the duration of the call.
+        # For threaded calls, they must persist until the thread is done.
+        # ctypes.byref creates a light-weight pointer. The original Python objects must be kept alive.
+        rkllm_input_obj = RKLLMInput() 
+        rkllm_input_obj.input_type = RKLLM_INPUT_PROMPT
+        rkllm_input_obj.prompt_input = ctypes.c_char_p(prompt_for_llm)
         
-        current_thread_id = threading.get_ident()
-        print(f"[API Handler {current_thread_id}] About to call rkllm_run. Stream: {stream_requested}. Async: {rkllm_params_global.is_async}. Timestamp: {time.time()}")
-        run_start_time = time.time()
+        rkllm_infer_params_obj = RKLLMInferParam()
+        rkllm_infer_params_obj.mode = RKLLM_INFER_GENERATE
+        rkllm_infer_params_obj.keep_history = 1
         
-        run_ret = rkllm_lib.rkllm_run(llm_handle, ctypes.byref(rkllm_input_obj), ctypes.byref(rkllm_infer_params_obj), None)
-        
-        # If is_async is False (blocking), rkllm_run finishes here.
-        # If is_async is True (non-blocking), rkllm_run returns quickly. Callbacks happen on another thread.
-        print(f"[API Handler {current_thread_id}] rkllm_run returned: {run_ret}. Duration: {time.time() - run_start_time:.4f}s. Qsize after run call: {stream_token_queue.qsize()}. Timestamp: {time.time()}")
-
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         model_name_to_return = rkllm_params_global.model_path.decode().split('/')[-1] if rkllm_params_global else "rkllm_model"
         created_ts = int(time.time())
-
-        if run_ret != 0: # This error is for the *initiation* of the run if async, or the full run if sync.
-            print(f"[API Error] rkllm_run failed (code {run_ret}).")
-            return format_openai_error_response(f"RKLLM run failed (code: {run_ret}).", "api_error"), 500
+        
+        run_ret_holder = {"value": 0} # To get return value from worker thread if needed, not strictly used now
 
         if stream_requested:
+            # For streaming, run rkllm_run in a separate thread.
+            # The main Flask thread will return the generator that pulls from the queue.
+            print(f"[API Handler {threading.get_ident()}] Starting worker thread for rkllm_run. Timestamp: {time.time()}")
+            
+            # Keep references to pass to thread
+            input_obj_ptr = ctypes.byref(rkllm_input_obj)
+            infer_params_obj_ptr = ctypes.byref(rkllm_infer_params_obj)
+
+            worker_thread = threading.Thread(target=rkllm_inference_worker, 
+                                             args=(llm_handle, input_obj_ptr, infer_params_obj_ptr))
+            worker_thread.start()
+            # The main thread does not wait for worker_thread to finish here.
+            # It proceeds to return the streaming response.
+
             def generate_stream_response_sse():
-                global conversation_history_bytes # Needed to modify global from nested func
+                global conversation_history_bytes # To update after stream
                 
                 print(f"[Stream SSE Gen {threading.get_ident()}] Starting generator. Timestamp: {time.time()}")
-                # This list will collect all parts for this specific stream response to update history later
                 streamed_response_for_history_update = [] 
                 try:
                     while True:
                         try:
-                            token_or_signal = stream_token_queue.get(timeout=30.0) # Longer timeout
-                            # print(f"[Stream SSE Gen {threading.get_ident()}] Got from queue: '{str(token_or_signal)[:50]}...'. Qsize: {stream_token_queue.qsize()}. Timestamp: {time.time()}")
+                            token_or_signal = stream_token_queue.get(timeout=45.0) # Increased timeout
                         except queue.Empty:
-                            print(f"[Stream SSE Gen {threading.get_ident()}] Timeout waiting for item from queue. Assuming stream ended or stalled. Timestamp: {time.time()}")
+                            print(f"[Stream SSE Gen {threading.get_ident()}] Timeout waiting for item from queue. Timestamp: {time.time()}")
                             break 
 
                         if token_or_signal is None: 
-                            print(f"[Stream SSE Gen {threading.get_ident()}] Received None (error/end signal). Ending stream. Timestamp: {time.time()}")
+                            print(f"[Stream SSE Gen {threading.get_ident()}] Received None (error/end signal). Timestamp: {time.time()}")
                             break 
                         
                         if token_or_signal == "__LLM_RUN_FINISH__":
@@ -223,10 +245,10 @@ def chat_completions_handler():
                             yield f"data: {json.dumps(final_chunk)}\n\n"
                             break
                         
-                        streamed_response_for_history_update.append(token_or_signal) # Collect for history
+                        streamed_response_for_history_update.append(token_or_signal) 
                         chunk = {"id": request_id, "object": "chat.completion.chunk", "created": created_ts, "model": model_name_to_return, "choices": [{"index": 0, "delta": {"content": token_or_signal}, "finish_reason": None}]}
                         yield f"data: {json.dumps(chunk)}\n\n"
-                        # time.sleep(0.01) # Tiny delay to help client perceive streaming if needed
+                        # time.sleep(0.005) # Minimal sleep to allow other threads, if any, to process. Can make streaming more "visible".
                 
                 except Exception as e_stream:
                     print(f"[Stream SSE Gen {threading.get_ident()}] Error: {e_stream}. Timestamp: {time.time()}")
@@ -234,33 +256,53 @@ def chat_completions_handler():
                     print(f"[Stream SSE Gen {threading.get_ident()}] Sending [DONE]. Timestamp: {time.time()}")
                     yield f"data: [DONE]\n\n"
                     
-                    # Update global conversation history after stream is complete
-                    # This is critical if rkllm_run was async.
-                    # The rkllm_lock is still held by the parent request handler.
-                    if run_ret == 0: # Check initial run_ret; actual errors might have occurred in stream
-                        full_response_this_turn = "".join(streamed_response_for_history_update)
-                        if full_response_this_turn: # Only update if something was generated
-                            new_segment = current_user_turn_bytes + ASSISTANT_TURN_START + full_response_this_turn.encode('utf-8') + ASSISTANT_TURN_END
-                            # The lock is already held by the main handler, so this modification is safe
-                            # with respect to other requests, but ensure this generator logic is sound.
-                            conversation_history_bytes += new_segment
-                            print(f"[API History Update after stream] History bytes: {len(conversation_history_bytes)}")
-                        # else:
-                            # print("[API History Update after stream] No content streamed to update history.")
+                    # Update global conversation history after stream is complete.
+                    # This needs to be done carefully with the rkllm_lock.
+                    # The worker thread might still be running or just finished.
+                    # The lock is acquired by the main request handler.
+                    # This update should ideally happen once the worker thread confirms completion.
+                    # For now, we assume current_assistant_response_parts got populated by the callbacks
+                    # which were triggered by the worker thread.
+                    
+                    # The lock is held by the parent (chat_completions_handler)
+                    # We need to ensure the worker_thread has finished before updating history based on its work.
+                    # However, we can't block the stream yield for worker_thread.join().
+                    # The current_assistant_response_parts is filled by the callback.
+                    # If rkllm_run was successful (worker didn't crash), current_assistant_response_parts should be accurate.
+                    
+                    # Let's wait for the worker thread here before updating history.
+                    # This means the [DONE] signal might be delayed until the worker thread fully exits.
+                    print(f"[Stream SSE Gen {threading.get_ident()}] Waiting for worker thread to complete before history update. Timestamp: {time.time()}")
+                    worker_thread.join(timeout=5.0) # Wait for worker to finish
+                    if worker_thread.is_alive():
+                        print(f"[Stream SSE Gen {threading.get_ident()}] WARNING: Worker thread did not complete in time after stream.")
+
+                    # Now that worker is done (or timed out), current_assistant_response_parts should be stable.
+                    # The lock is still held by the main request handler.
+                    full_response_this_turn = "".join(current_assistant_response_parts) # These parts were for this turn
+                    if full_response_this_turn: 
+                        new_segment = current_user_turn_bytes + ASSISTANT_TURN_START + full_response_this_turn.encode('utf-8') + ASSISTANT_TURN_END
+                        conversation_history_bytes += new_segment
+                        print(f"[API History Update after stream generation] History bytes: {len(conversation_history_bytes)}")
 
 
-            # For async rkllm_run, we don't update history here based on current_assistant_response_parts
-            # because it might be incomplete. The generator will handle it.
-            # If rkllm_run is sync, current_assistant_response_parts is complete here.
-            # The logic inside the generator now handles history update for streaming.
             return Response(stream_with_context(generate_stream_response_sse()), mimetype='text/event-stream')
         
-        else: # One-shot response (rkllm_run is blocking, current_assistant_response_parts is complete)
+        else: # One-shot response (rkllm_run is blocking if is_async=False)
+            print(f"[API Handler {threading.get_ident()}] Calling rkllm_run (sync). Timestamp: {time.time()}")
+            run_start_time = time.time()
+            run_ret = rkllm_lib.rkllm_run(llm_handle, ctypes.byref(rkllm_input_obj), ctypes.byref(rkllm_infer_params_obj), None)
+            run_end_time = time.time()
+            print(f"[API Handler {threading.get_ident()}] rkllm_run (sync) returned: {run_ret}. Duration: {run_end_time - run_start_time:.4f}s. Qsize: {stream_token_queue.qsize()}. Timestamp: {time.time()}")
+
+            if run_ret != 0:
+                print(f"[API Error] rkllm_run (sync) failed (code {run_ret}).")
+                return format_openai_error_response(f"RKLLM run failed (code: {run_ret}).", "api_error"), 500
+
             full_assistant_response_str = "".join(current_assistant_response_parts)
             if run_ret == 0: 
                 new_segment = current_user_turn_bytes + ASSISTANT_TURN_START + full_assistant_response_str.encode('utf-8') + ASSISTANT_TURN_END
                 conversation_history_bytes += new_segment
-                # print(f"[API History Update one-shot] History bytes: {len(conversation_history_bytes)}")
 
             prompt_tokens_est = len(prompt_for_llm) // 4 
             completion_tokens_est = len(full_assistant_response_str) // 4
@@ -271,8 +313,6 @@ def chat_completions_handler():
 if __name__ == '__main__':
     if init_rkllm_model():
         print("Starting Flask server for RKLLM OpenAI-compliant API on http://0.0.0.0:5001/v1/chat/completions")
-        # Set debug=False for production, threaded=True is good for handling concurrent connections
-        # while rkllm_lock serializes actual LLM work.
         app.run(host='0.0.0.0', port=5001, threaded=True, debug=False) 
     else:
         print("Failed to initialize RKLLM model. Server not starting.")
