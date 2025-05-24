@@ -178,11 +178,10 @@ rkllm.rkllm_destroy.argtypes = [LLMHandle]
 # --- Main Inference Logic ---
 def run_inference():
     # Enable RKLLM Logging (Level 1 for performance, 2 for detailed)
-    # This should be set before library initialization ideally.
-    os.environ['RKLLM_LOG_LEVEL'] = '1' 
+    os.environ['RKLLM_LOG_LEVEL'] = '1'
     print(f"RKLLM_LOG_LEVEL set to: {os.environ['RKLLM_LOG_LEVEL']}")
 
-    print("Starting RKLLM Inference Script...")
+    print("Starting RKLLM Interactive Conversation...")
 
     llm_handle = LLMHandle()
 
@@ -190,15 +189,8 @@ def run_inference():
     param = rkllm.rkllm_createDefaultParam()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    # New model path as requested by user
     model_relative_path = "../model/Qwen3-0.6B-w8a8-opt1-hybrid1-npu3.rkllm"
-    
-    # Construct the absolute path to the model
-    # os.path.join will correctly handle the '../' part if script_dir is an absolute path
     model_abs_path = os.path.join(script_dir, model_relative_path)
-    
-    # Normalize the path to resolve '..' and get the canonical path
-    # This makes the path cleaner and ensures it's absolute
     model_canonical_path = os.path.normpath(model_abs_path)
 
     if os.path.exists(model_canonical_path):
@@ -207,7 +199,7 @@ def run_inference():
         print(f"Error: Model file not found at '{model_canonical_path}' (derived from relative path '{model_relative_path}')")
         print(f"Please ensure the model exists at the specified relative path from the script directory.")
         return
-    
+
     print(f"Using model: {param.model_path.decode()}")
 
     print("Initializing RKLLM model...")
@@ -217,32 +209,41 @@ def run_inference():
         return
     print("RKLLM model initialized successfully.")
 
-    prompt_prefix = b"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
-    user_query = b"Write a 500 word essay"
-    prompt_postfix = b"<|im_end|>\n<|im_start|>assistant\n"
-    
-    full_prompt_str = prompt_prefix + user_query + prompt_postfix
-    
-    rkllm_input = RKLLMInput()
-    rkllm_input.input_type = RKLLM_INPUT_PROMPT
-    rkllm_input.prompt_input = ctypes.c_char_p(full_prompt_str) 
+    # Conversation loop
+    print("\nType your message and press Enter. Type 'exit' or 'quit' to end the conversation.\n")
+    prompt_prefix = b"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+    history = prompt_prefix
+    while True:
+        user_input = input("You: ")
+        if user_input.strip().lower() in ["exit", "quit"]:
+            print("Exiting conversation.")
+            break
+        # Build prompt with conversation history and new user input
+        prompt = history + b"<|im_start|>user\n" + user_input.encode('utf-8') + b"<|im_end|>\n<|im_start|>assistant\n"
 
-    rkllm_infer_params = RKLLMInferParam()
-    rkllm_infer_params.mode = RKLLM_INFER_GENERATE
-    rkllm_infer_params.keep_history = 0 
+        rkllm_input = RKLLMInput()
+        rkllm_input.input_type = RKLLM_INPUT_PROMPT
+        rkllm_input.prompt_input = ctypes.c_char_p(prompt)
 
-    print(f"\nSending prompt: {full_prompt_str.decode('utf-8', errors='replace')}")
-    print("Assistant's Response:")
-    
-    ret = rkllm.rkllm_run(llm_handle, ctypes.byref(rkllm_input), ctypes.byref(rkllm_infer_params), None) 
-    if ret != 0:
-        print(f"\nError: rkllm_run failed with code {ret}")
+        rkllm_infer_params = RKLLMInferParam()
+        rkllm_infer_params.mode = RKLLM_INFER_GENERATE
+        rkllm_infer_params.keep_history = 1  # Set to 1 to preserve context if supported
+
+        print("Assistant's Response:")
+        ret = rkllm.rkllm_run(llm_handle, ctypes.byref(rkllm_input), ctypes.byref(rkllm_infer_params), None)
+        if ret != 0:
+            print(f"\nError: rkllm_run failed with code {ret}")
+        # Add user and assistant turns to history for next round
+        # (If you want to append the assistant's output, you can extend this logic)
+        history = prompt
 
     print("Destroying RKLLM model...")
     ret_destroy = rkllm.rkllm_destroy(llm_handle)
     if ret_destroy != 0:
         print(f"Error: rkllm_destroy failed with code {ret_destroy}")
     else:
+        print("RKLLM model destroyed successfully.")
+
         print("RKLLM model destroyed successfully.")
 
 if __name__ == "__main__":
