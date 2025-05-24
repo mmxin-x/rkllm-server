@@ -92,7 +92,7 @@ def init_rkllm_model():
     
     rkllm_params_global = rkllm_lib.rkllm_createDefaultParam()
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    model_relative_path = "../model/Qwen3-0.6B-w8a8-opt1-hybrid1-npu3.rkllm"
+    model_relative_path = "../model/Gemma3-1B-w8a8-opt1.rkllm"
     model_abs_path = os.path.join(script_dir, model_relative_path)
     model_canonical_path = os.path.normpath(model_abs_path)
     if not os.path.exists(model_canonical_path): print(f"Error: Model file not found: '{model_canonical_path}'"); return False
@@ -312,8 +312,8 @@ def chat_completions_handler():
 # --- Main Entry Point ---
 if __name__ == '__main__':
     if init_rkllm_model():
-        print("Starting Flask server for RKLLM OpenAI-compliant API on http://0.0.0.0:5001/v1/chat/completions")
-        app.run(host='0.0.0.0', port=5001, threaded=True, debug=False) 
+        print("Starting Flask server for RKLLM OpenAI-compliant API on http://0.0.0.0:1306/v1/chat/completions")
+        app.run(host='0.0.0.0', port=1306, threaded=True, debug=False) 
     else:
         print("Failed to initialize RKLLM model. Server not starting.")
 

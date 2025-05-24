@@ -1,7 +1,7 @@
 import requests
 import json
 
-API_URL = "http://127.0.0.1:5001/v1/chat/completions"
+API_URL = "http://127.0.0.1:1306/v1/chat/completions"
 HEADERS = {"Content-Type": "application/json"}
 
 def call_api_one_shot(user_message):

@@ -95,13 +95,13 @@ def init_rkllm_model():
     
     rkllm_params_global = rkllm_lib.rkllm_createDefaultParam()
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    model_relative_path = "../model/Qwen3-0.6B-w8a8-opt1-hybrid1-npu3.rkllm"
+    model_relative_path = "../model/Gemma3-1B-w8a8-opt1.rkllm"
     model_abs_path = os.path.join(script_dir, model_relative_path)
     model_canonical_path = os.path.normpath(model_abs_path)
     if not os.path.exists(model_canonical_path): print(f"Error: Model file not found: '{model_canonical_path}'"); return False
     
     rkllm_params_global.model_path = model_canonical_path.encode('utf-8')
-    rkllm_params_global.use_gpu = True
+    rkllm_params_global.use_gpu = False
     rkllm_params_global.max_context_len = 30000 
     rkllm_params_global.n_keep = 32
     if rkllm_params_global.max_new_tokens == 0: rkllm_params_global.max_new_tokens = 512
@@ -311,11 +311,7 @@ def chat_completions_handler():
 # --- Main Entry Point ---
 if __name__ == '__main__':
     if init_rkllm_model():
-        print("Starting Flask server for RKLLM OpenAI-compliant API on http://0.0.0.0:5001/v1/chat/completions")
-        app.run(host='0.0.0.0', port=5001, threaded=True, debug=False) 
+        print("Starting Flask server for RKLLM OpenAI-compliant API on http://0.0.0.0:1306/v1/chat/completions")
+        app.run(host='0.0.0.0', port=1306, threaded=True, debug=False) 
     else:
         print("Failed to initialize RKLLM model. Server not starting.")
-```
-
-Now, when you run your client and make a request, check the server logs for the lines starting with `[API Handler DEBUG] Sending Prompt to RKLLM...`. This will show you the exact context being fed to the model for each turn.
-If the "I am Thomas" part is present in the prompt for the second turn, but the model still doesn't remember, then the issue is not with the Python string accumulation but rather with how the model/library utilizes that context or maintains its internal KV sta
