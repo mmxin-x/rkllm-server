@@ -30,6 +30,7 @@ def test_conversation(use_streaming=False):
         # Prepare the request payload
         messages = [
             {"role": "system", "content": "You are a helpful assistant."}, 
+            {"role": "user", "content": "hi, I am Thomas"},
             {"role": "user", "content": user_input}
         ]
         
