@@ -2,8 +2,11 @@ import requests
 import json
 import sys
 
+# Import settings from config.py
+from config import *
+
 # Direct HTTP client configuration
-BASE_URL = "http://0.0.0.0:1306/v1"
+BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}{API_BASE_PATH}"
 
 def test_conversation(use_streaming=False):
     try:
@@ -29,13 +32,21 @@ def test_conversation(use_streaming=False):
         
         # Prepare the request payload
         messages = [
-            {"role": "system", "content": "You are a helpful assistant."}, 
-            {"role": "user", "content": "hi, I am Thomas"},
+            {"role": "system", "content": SYSTEM_PROMPT}, 
             {"role": "user", "content": user_input}
         ]
         
+        # Get model name from server response if available
+        model_name = "Qwen3-0.6B-RKLLM"  # Default fallback model name
+        try:
+            # Use the model name from the server response if available
+            if response.status_code == 200 and response.json().get("data") and len(response.json()["data"]) > 0:
+                model_name = response.json()["data"][0]["id"]
+        except Exception:
+            pass
+            
         payload = {
-            "model": "Qwen3-0.6B-RKLLM",
+            "model": model_name,
             "messages": messages,
             "stream": use_streaming
         }

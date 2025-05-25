@@ -1,10 +1,11 @@
 import ctypes
 import os
 
+# Import settings from config.py
+from config import *
 
 # --- Load RKLLM Shared Library ---
-# Adjust 'librkllmrt.so' if the name is different or provide a full path
-LIB_RKLLM_PATH = './src/librkllmrt.so'
+LIB_RKLLM_PATH = LIBRARY_PATH
 rkllm = ctypes.CDLL(LIB_RKLLM_PATH)
 
 
@@ -129,8 +130,8 @@ rkllm.rkllm_destroy.argtypes = [LLMHandle]
 
 # --- Main Inference Logic ---
 def run_inference():
-    # Enable RKLLM Logging (Level 1 for performance, 2 for detailed)
-    os.environ['RKLLM_LOG_LEVEL'] = '1'
+    # Enable RKLLM Logging from config
+    os.environ['RKLLM_LOG_LEVEL'] = str(LOG_LEVEL)
     print(f"RKLLM_LOG_LEVEL set to: {os.environ['RKLLM_LOG_LEVEL']}")
 
     print("Starting RKLLM Interactive Conversation...")
@@ -140,24 +141,29 @@ def run_inference():
     print("Creating default parameters...")
     param = rkllm.rkllm_createDefaultParam()
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    model_relative_path = "../model/Qwen3-0.6B-w8a8-opt1-hybrid1-npu3.rkllm"
-    model_abs_path = os.path.join(script_dir, model_relative_path)
-    model_canonical_path = os.path.normpath(model_abs_path)
+    # Use model path from config
+    model_path = MODEL_PATH
 
-    if os.path.exists(model_canonical_path):
-        param.model_path = model_canonical_path.encode('utf-8')
+    if os.path.exists(model_path):
+        param.model_path = model_path.encode('utf-8')
     else:
-        print(f"Error: Model file not found at '{model_canonical_path}' (derived from relative path '{model_relative_path}')")
-        print(f"Please ensure the model exists at the specified relative path from the script directory.")
+        print(f"Error: Model file not found at '{model_path}'")
+        print("Please check the MODEL_PATH setting in config.py")
         return
 
+    # Set parameters from config
+    param.use_gpu = USE_GPU
+    param.max_context_len = MAX_CONTEXT_LENGTH
+    param.n_keep = N_KEEP
+    param.is_async = IS_ASYNC
+    if param.max_new_tokens == 0 and MAX_NEW_TOKENS > 0:
+        param.max_new_tokens = MAX_NEW_TOKENS
+
     print(f"Using model: {param.model_path.decode()}")
+    print(f"Parameters: max_context_len={param.max_context_len}, n_keep={param.n_keep}, use_gpu={param.use_gpu}")
 
     print("Initializing RKLLM model...")
     ret = rkllm.rkllm_init(ctypes.byref(llm_handle), ctypes.byref(param), python_llm_callback)
-    # ret = rkllm.rkllm_run(model_instance.llm_handle, ctypes.byref(rkllm_input), 
-                          # ctypes.byref(rkllm_infer_params), global_callback)
     if ret != 0:
         print(f"Error: rkllm_init failed with code {ret}")
         return
@@ -165,7 +171,7 @@ def run_inference():
 
     # Conversation loop
     print("\nType your message and press Enter. Type 'exit' or 'quit' to end the conversation.\n")
-    prompt_prefix = b"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+    prompt_prefix = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n".encode('utf-8')
     history = prompt_prefix
     while True:
         user_input = input("You: ")

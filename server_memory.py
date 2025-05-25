@@ -7,6 +7,9 @@ import threading
 import queue # For thread-safe queue
 from flask import Flask, request, Response, jsonify, stream_with_context
 
+# Import settings from config.py
+from config import *
+
 # --- Global State & Configuration ---
 rkllm_lib = None
 llm_handle = ctypes.c_void_p()
@@ -82,7 +85,13 @@ def find_library_path(lib_name):
 def init_rkllm_model():
     global rkllm_lib, llm_handle, rkllm_params_global, model_initialized, conversation_history_bytes
     if model_initialized: return True
-    lib_path = find_library_path('librkllmrt.so')
+    
+    # Use the library path from config
+    lib_path = LIBRARY_PATH
+    # Fall back to path search if config path doesn't exist
+    if not os.path.exists(lib_path):
+        lib_path = find_library_path('librkllmrt.so')
+    
     if not lib_path: print("Error: librkllmrt.so not found."); return False
     try: rkllm_lib = ctypes.CDLL(lib_path); print(f"Loaded RKLLM library from '{lib_path}'")
     except OSError as e: print(f"Error loading RKLLM library: {e}"); return False
@@ -94,21 +103,24 @@ def init_rkllm_model():
     rkllm_lib.rkllm_clear_kv_cache.argtypes = [ctypes.c_void_p, ctypes.c_int]; rkllm_lib.rkllm_clear_kv_cache.restype = ctypes.c_int
     
     rkllm_params_global = rkllm_lib.rkllm_createDefaultParam()
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    model_relative_path = "../model/Qwen3-0.6B-w8a8-opt1-hybrid1-npu3.rkllm"
-    model_abs_path = os.path.join(script_dir, model_relative_path)
-    model_canonical_path = os.path.normpath(model_abs_path)
-    if not os.path.exists(model_canonical_path): print(f"Error: Model file not found: '{model_canonical_path}'"); return False
     
-    rkllm_params_global.model_path = model_canonical_path.encode('utf-8')
-    rkllm_params_global.use_gpu = True
-    rkllm_params_global.max_context_len = 30000 
-    rkllm_params_global.n_keep = 32
-    if rkllm_params_global.max_new_tokens == 0: rkllm_params_global.max_new_tokens = 512
+    # Use model path from config
+    model_path = MODEL_PATH
+    if not os.path.exists(model_path): 
+        print(f"Error: Model file not found: '{model_path}'"); 
+        return False
     
-    rkllm_params_global.is_async = False # Using synchronous mode with worker thread for streaming
+    rkllm_params_global.model_path = model_path.encode('utf-8')
+    rkllm_params_global.use_gpu = USE_GPU
+    rkllm_params_global.max_context_len = MAX_CONTEXT_LENGTH 
+    rkllm_params_global.n_keep = N_KEEP
+    if rkllm_params_global.max_new_tokens == 0 and MAX_NEW_TOKENS > 0: 
+        rkllm_params_global.max_new_tokens = MAX_NEW_TOKENS
     
-    os.environ['RKLLM_LOG_LEVEL'] = '1' 
+    # Set async mode from config
+    rkllm_params_global.is_async = IS_ASYNC
+
+    os.environ['RKLLM_LOG_LEVEL'] = str(LOG_LEVEL)
     print(f"RKLLM_LOG_LEVEL: {os.environ['RKLLM_LOG_LEVEL']}")
     print(f"Initializing model with parameters: \n"
           f"  Path: {rkllm_params_global.model_path.decode()}\n"
@@ -121,7 +133,8 @@ def init_rkllm_model():
     ret = rkllm_lib.rkllm_init(ctypes.byref(llm_handle), ctypes.byref(rkllm_params_global), api_llm_callback)
     if ret != 0: print(f"Error: rkllm_init failed (code {ret})."); return False
     
-    conversation_history_bytes = SYS_PROMPT_TEMPLATE.replace(b"{system_message}", DEFAULT_SYSTEM_MESSAGE.encode('utf-8'))
+    # Use system prompt from config
+    conversation_history_bytes = SYS_PROMPT_TEMPLATE.replace(b"{system_message}", SYSTEM_PROMPT.encode('utf-8'))
     model_initialized = True
     print("RKLLM model initialized.")
     return True
@@ -311,7 +324,7 @@ def chat_completions_handler():
 # --- Main Entry Point ---
 if __name__ == '__main__':
     if init_rkllm_model():
-        print("Starting Flask server for RKLLM OpenAI-compliant API on http://0.0.0.0:1306/v1/chat/completions")
-        app.run(host='0.0.0.0', port=1306, threaded=True, debug=False) 
+        print(f"Starting Flask server for RKLLM OpenAI-compliant API on http://{SERVER_HOST}:{SERVER_PORT}{API_BASE_PATH}/chat/completions")
+        app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True, debug=DEBUG_MODE) 
     else:
         print("Failed to initialize RKLLM model. Server not starting.")
