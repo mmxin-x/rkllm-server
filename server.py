@@ -12,7 +12,7 @@ rkllm_lib = None
 llm_handle = ctypes.c_void_p()
 rkllm_params_global = None
 model_initialized = False
-
+conversation_history_bytes = b""
 current_assistant_response_parts = [] 
 
 rkllm_lock = threading.Lock() # Lock for critical RKLLM sections and shared state
@@ -35,12 +35,12 @@ class RKLLMInput(ctypes.Structure): _anonymous_ = ("_input_data",); _fields_ = [
 class RKLLMInferParam(ctypes.Structure): _fields_ = [("mode", ctypes.c_int), ("lora_params", ctypes.c_void_p), ("prompt_cache_params", ctypes.c_void_p), ("keep_history", ctypes.c_int)]
 LLMResultCallback = ctypes.CFUNCTYPE(None, ctypes.POINTER(RKLLMResult), ctypes.c_void_p, ctypes.c_int)
 
-# SYS_PROMPT_TEMPLATE = b"<|im_start|>system\n{system_message}<|im_end|>\n"
-# USER_TURN_START = b"<|im_start|>user\n"
-# USER_TURN_END = b"<|im_end|>\n"
-# ASSISTANT_TURN_START = b"<|im_start|>assistant\n"
-# ASSISTANT_TURN_END = b"<|im_end|>\n"
-# DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
+SYS_PROMPT_TEMPLATE = b"<|im_start|>system\n{system_message}<|im_end|>\n"
+USER_TURN_START = b"<|im_start|>user\n"
+USER_TURN_END = b"<|im_end|>\n"
+ASSISTANT_TURN_START = b"<|im_start|>assistant\n"
+ASSISTANT_TURN_END = b"<|im_end|>\n"
+DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
 
 stream_token_queue = queue.Queue()
 
@@ -77,7 +77,7 @@ def find_library_path(lib_name):
     return None
 
 def init_rkllm_model():
-    global rkllm_lib, llm_handle, rkllm_params_global, model_initialized
+    global rkllm_lib, llm_handle, rkllm_params_global, model_initialized, conversation_history_bytes
     if model_initialized: return True
     lib_path = find_library_path('librkllmrt.so')
     if not lib_path: print("Error: librkllmrt.so not found."); return False
@@ -92,7 +92,7 @@ def init_rkllm_model():
     
     rkllm_params_global = rkllm_lib.rkllm_createDefaultParam()
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    model_relative_path = "../model/Gemma3-1B-w8a8-opt1.rkllm"
+    model_relative_path = "../model/Qwen3-0.6B-w8a8-opt1-hybrid1-npu3.rkllm"
     model_abs_path = os.path.join(script_dir, model_relative_path)
     model_canonical_path = os.path.normpath(model_abs_path)
     if not os.path.exists(model_canonical_path): print(f"Error: Model file not found: '{model_canonical_path}'"); return False
@@ -100,7 +100,7 @@ def init_rkllm_model():
     rkllm_params_global.model_path = model_canonical_path.encode('utf-8')
     rkllm_params_global.use_gpu = True
     rkllm_params_global.max_context_len = 30000 
-    rkllm_params_global.n_keep = 28000
+    rkllm_params_global.n_keep = 32
     if rkllm_params_global.max_new_tokens == 0: rkllm_params_global.max_new_tokens = 512
     
     # --- SETTING is_async TO FALSE (like manufacturer's example) ---
@@ -152,7 +152,7 @@ def rkllm_inference_worker(handle, input_obj_ptr, infer_params_obj_ptr):
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def chat_completions_handler():
-    global current_assistant_response_parts, rkllm_params_global, llm_handle, rkllm_lib, stream_token_queue
+    global conversation_history_bytes, current_assistant_response_parts, rkllm_params_global, llm_handle, rkllm_lib, stream_token_queue
     
     if not model_initialized: return format_openai_error_response("RKLLM model not initialized.", "api_error"), 500
     try: request_data = request.get_json()
@@ -168,16 +168,20 @@ def chat_completions_handler():
 
     # rkllm_lock ensures that context management, rkllm_run call, and history updates are atomic per request.
     with rkllm_lock: 
-        prompt_for_llm = USER_TURN_START + last_user_message_content.encode('utf-8') + USER_TURN_END + ASSISTANT_TURN_START
+        current_user_turn_bytes = USER_TURN_START + last_user_message_content.encode('utf-8') + USER_TURN_END
+        prompt_for_llm = conversation_history_bytes + current_user_turn_bytes + ASSISTANT_TURN_START
         
         EFFECTIVE_PROMPT_TOKEN_LIMIT = 500 
         estimated_prompt_tokens = len(prompt_for_llm) / 3.5
         
         if estimated_prompt_tokens > EFFECTIVE_PROMPT_TOKEN_LIMIT:
             print(f"\n[API Ctx Mgmt] Est. prompt tokens ({int(estimated_prompt_tokens)}) > limit ({EFFECTIVE_PROMPT_TOKEN_LIMIT}). Clearing KV cache.")
-            clear_ret = rkllm_lib.rkllm_clear_kv_cache(llm_handle, 1)
+            clear_ret = rkllm_lib.rkllm_clear_kv_cache(llm_handle, 1) 
             if clear_ret == 0:
                 print("[API Ctx Mgmt] KV cache cleared.")
+                conversation_history_bytes = SYS_PROMPT_TEMPLATE.replace(b"{system_message}", DEFAULT_SYSTEM_MESSAGE.encode('utf-8'))
+                prompt_for_llm = conversation_history_bytes + current_user_turn_bytes + ASSISTANT_TURN_START
+                print(f"[API Ctx Mgmt] History reset. New prompt est: {int(len(prompt_for_llm)/3.5)} tokens.")
             else:
                 print(f"[API Ctx Mgmt] Error clearing KV cache (code: {clear_ret}).")
         
@@ -275,7 +279,11 @@ def chat_completions_handler():
 
                     # Now that worker is done (or timed out), current_assistant_response_parts should be stable.
                     # The lock is still held by the main request handler.
-                    
+                    full_response_this_turn = "".join(current_assistant_response_parts) # These parts were for this turn
+                    if full_response_this_turn: 
+                        new_segment = current_user_turn_bytes + ASSISTANT_TURN_START + full_response_this_turn.encode('utf-8') + ASSISTANT_TURN_END
+                        conversation_history_bytes += new_segment
+                        print(f"[API History Update after stream generation] History bytes: {len(conversation_history_bytes)}")
 
 
             return Response(stream_with_context(generate_stream_response_sse()), mimetype='text/event-stream')
@@ -292,7 +300,9 @@ def chat_completions_handler():
                 return format_openai_error_response(f"RKLLM run failed (code: {run_ret}).", "api_error"), 500
 
             full_assistant_response_str = "".join(current_assistant_response_parts)
-            
+            if run_ret == 0: 
+                new_segment = current_user_turn_bytes + ASSISTANT_TURN_START + full_assistant_response_str.encode('utf-8') + ASSISTANT_TURN_END
+                conversation_history_bytes += new_segment
 
             prompt_tokens_est = len(prompt_for_llm) // 4 
             completion_tokens_est = len(full_assistant_response_str) // 4
@@ -306,4 +316,3 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=1306, threaded=True, debug=False) 
     else:
         print("Failed to initialize RKLLM model. Server not starting.")
-

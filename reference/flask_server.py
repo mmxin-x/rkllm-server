@@ -15,7 +15,7 @@ PROMPT_TEXT_PREFIX = "<|im_start|>system You are a helpful assistant. <|im_end|>
 PROMPT_TEXT_POSTFIX = "<|im_end|><|im_start|>assistant"
 
 # Set the dynamic library path
-rkllm_lib = ctypes.CDLL('lib/librkllmrt.so')
+rkllm_lib = ctypes.CDLL('../src/librkllmrt.so')
 
 # Define the structures from the library
 RKLLM_Handle_t = ctypes.c_void_p
@@ -330,9 +330,18 @@ if __name__ == "__main__":
 
     # Initialize RKLLM model
     print("=========init....===========")
-    sys.stdout.flush()
+    try:
+        sys.stdout.flush()
+    except Exception as e:
+        print("Error: Exception occurred during sys.stdout.flush(): {}".format(str(e)))
     model_path = args.rkllm_model_path
-    rkllm_model = RKLLM(model_path, args.lora_model_path, args.prompt_cache_path)
+    try:
+        rkllm_model = RKLLM(model_path, args.lora_model_path, args.prompt_cache_path)
+    except Exception as e:
+        print("Error: RKLLM model initialization failed!")
+        print(str(e))
+        sys.stdout.flush()
+        exit()
     print("RKLLM Model has been initialized successfully！")
     print("==============================")
     sys.stdout.flush()

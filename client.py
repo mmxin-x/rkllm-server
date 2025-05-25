@@ -1,98 +1,105 @@
 import requests
 import json
+import sys
 
-API_URL = "http://127.0.0.1:1306/v1/chat/completions"
-HEADERS = {"Content-Type": "application/json"}
+# Direct HTTP client configuration
+BASE_URL = "http://0.0.0.0:1306/v1"
 
-def call_api_one_shot(user_message):
-    """Calls the API for a non-streaming (one-shot) response."""
-    payload = {
-        "messages": [
-            {"role": "user", "content": user_message}
-        ],
-        "stream": False
-    }
+def test_conversation(use_streaming=False):
     try:
-        response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=120) # 120 second timeout
-        response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+        print("Starting test conversation with the model...\n")
         
-        data = response.json()
-        if data.get("choices") and len(data["choices"]) > 0:
-            assistant_message = data["choices"][0].get("message", {}).get("content")
-            print("\nAssistant (One-shot):")
-            print(assistant_message)
-            if data.get("usage"):
-                print(f"\nUsage (estimated): {data['usage']}")
-        else:
-            print("\nReceived an empty or unexpected response:")
-            print(data)
-
-    except requests.exceptions.RequestException as e:
-        print(f"\nError calling API: {e}")
-    except json.JSONDecodeError:
-        print("\nError: Could not decode JSON response from server.")
-        print(f"Raw response: {response.text}")
-
-
-def call_api_streaming(user_message):
-    """Calls the API for a streaming response."""
-    payload = {
-        "messages": [
-            {"role": "user", "content": user_message}
-        ],
-        "stream": True
-    }
-    print("\nAssistant (Streaming):")
-    try:
-        with requests.post(API_URL, headers=HEADERS, json=payload, stream=True, timeout=120) as response: # 120 second timeout
-            response.raise_for_status()
-            for line in response.iter_lines():
-                if line:
-                    decoded_line = line.decode('utf-8')
-                    if decoded_line.startswith("data: "):
-                        json_data_str = decoded_line[len("data: "):]
-                        if json_data_str.strip() == "[DONE]":
-                            print("\n<End of stream>")
-                            break
-                        try:
-                            json_data = json.loads(json_data_str)
-                            if json_data.get("choices") and len(json_data["choices"]) > 0:
-                                delta = json_data["choices"][0].get("delta", {})
-                                content_chunk = delta.get("content")
-                                if content_chunk:
-                                    print(content_chunk, end="", flush=True)
-                                if json_data["choices"][0].get("finish_reason"):
-                                    print(f"\n<Stream finished with reason: {json_data['choices'][0]['finish_reason']}>")
-                                    break # Exit loop once finish_reason is received
-                        except json.JSONDecodeError:
-                            # print(f"\nError decoding JSON chunk: {json_data_str}") # Can be noisy
-                            pass # Silently ignore lines that are not valid JSON data chunks
-
-    except requests.exceptions.RequestException as e:
-        print(f"\nError calling API: {e}")
-    except Exception as e_stream:
-        print(f"\nAn unexpected error occurred during streaming: {e_stream}")
-    finally:
-        print() # Ensure a newline after streaming is complete or if an error occurs
-
-
-if __name__ == "__main__":
-    while True:
+        # First, check that we can access the models endpoint
         try:
-            user_input = input("\nEnter your message (or type 'quit' to exit): ")
-            if user_input.lower() == 'quit':
-                break
-
-            stream_choice = input("Stream response? (yes/no) [yes]: ").lower().strip()
-            if stream_choice == "" or stream_choice == "y" or stream_choice == "yes":
-                call_api_streaming(user_input)
-            elif stream_choice == "n" or stream_choice == "no":
-                call_api_one_shot(user_input)
+            response = requests.get(f"{BASE_URL}/models")
+            if response.status_code == 200:
+                print(f"Models available: {json.dumps(response.json(), indent=2)}\n")
             else:
-                print("Invalid choice for streaming. Please enter 'yes' or 'no'.")
-
-        except KeyboardInterrupt:
-            print("\nExiting client...")
-            break
+                print(f"HTTP Error: {response.status_code} - {response.text}\n")
         except Exception as e:
-            print(f"An unexpected error occurred in the client: {e}")
+            print(f"Error accessing models: {str(e)}\n")
+        
+        # Get user input for the conversation
+        user_input = input("Enter your message (or press Enter to use default): ")
+        if not user_input:
+            user_input = "Tell me a short joke about programming."
+        
+        print(f"\nUser: {user_input}")
+        print("Assistant: ", end="", flush=True)
+        
+        # Prepare the request payload
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."}, 
+            {"role": "user", "content": user_input}
+        ]
+        
+        payload = {
+            "model": "Qwen3-0.6B-RKLLM",
+            "messages": messages,
+            "stream": use_streaming
+        }
+        
+        # Make the request to the chat completions endpoint
+        if use_streaming:
+            # Streaming mode
+            print("\nUsing streaming mode...\n")
+            response = requests.post(
+                f"{BASE_URL}/chat/completions",
+                json=payload,
+                stream=True,
+                headers={"Accept": "text/event-stream"}
+            )
+            
+            if response.status_code == 200:
+                # Process the streaming response
+                for line in response.iter_lines():
+                    if line:
+                        line = line.decode('utf-8')
+                        if line.startswith('data: '):
+                            data = line[6:]
+                            if data == "[DONE]":
+                                break
+                                
+                            try:
+                                chunk = json.loads(data)
+                                if chunk.get('choices') and len(chunk['choices']) > 0:
+                                    delta = chunk['choices'][0].get('delta', {})
+                                    if delta and 'content' in delta and delta['content']:
+                                        print(delta['content'], end='', flush=True)
+                            except json.JSONDecodeError as e:
+                                print(f"\nError decoding JSON: {e}\nRaw data: {data}")
+            else:
+                print(f"\nHTTP Error: {response.status_code} - {response.text}")
+        else:
+            # Non-streaming mode
+            print("\nUsing non-streaming mode...\n")
+            response = requests.post(
+                f"{BASE_URL}/chat/completions",
+                json=payload
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                print(f"Response headers: {response.headers}")
+                print(f"Raw response: {json.dumps(result, indent=2)}")
+                
+                if result.get('choices') and len(result['choices']) > 0:
+                    message = result['choices'][0].get('message', {})
+                    content = message.get('content', '')
+                    if content and content.strip():
+                        print(f"\nModel response: {content}")
+                    else:
+                        print("\n[No content received from model]")
+                else:
+                    print("\nNo choices found in response")
+            else:
+                print(f"\nHTTP Error: {response.status_code} - {response.text}")     
+        print("\n\nConversation completed.")
+        
+    except Exception as e:
+        print(f"\nError: {str(e)}")
+
+# Run the test
+if __name__ == "__main__":
+    # Set to False to use non-streaming mode (more reliable for testing)
+    test_conversation(use_streaming=True)

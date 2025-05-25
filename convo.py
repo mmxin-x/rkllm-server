@@ -1,60 +1,12 @@
 import ctypes
 import os
 
-# --- Helper to find the library ---
-def find_library(lib_name):
-    # Get the directory of the current script
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # Common library paths
-    paths = [
-        '.', # Current working directory
-        script_dir, # Directory of the script itself
-        os.path.join(script_dir, 'aarch64'), # aarch64 folder sibling to script's parent
-        os.path.join(script_dir, 'lib'), # if lib is in a subdir of the script's dir
-        '/usr/lib',
-        '/usr/local/lib',
-    ]
-    # Add paths from LD_LIBRARY_PATH
-    if 'LD_LIBRARY_PATH' in os.environ:
-        paths.extend(os.environ['LD_LIBRARY_PATH'].split(os.pathsep))
-
-    # Deduplicate paths while preserving order (for Python 3.7+)
-    seen = set()
-    unique_paths = []
-    for path_item in paths:
-        if path_item not in seen:
-            seen.add(path_item)
-            unique_paths.append(path_item)
-    
-    print(f"Searching for '{lib_name}' in paths: {unique_paths}") # Debug print
-
-    for path in unique_paths:
-        lib_path = os.path.join(path, lib_name)
-        if os.path.exists(lib_path):
-            print(f"Found library at: {lib_path}") # Debug print
-            return lib_path
-        else:
-            print(f"Not found at: {lib_path}") # Debug print
-            
-    return None
 
 # --- Load RKLLM Shared Library ---
 # Adjust 'librkllmrt.so' if the name is different or provide a full path
-LIB_RKLLM_PATH = find_library('librkllmrt.so')
-if LIB_RKLLM_PATH is None:
-    # Fallback if not found in common paths, user might need to set this manually
-    LIB_RKLLM_PATH = 'librkllmrt.so' 
-    print(f"Warning: '{LIB_RKLLM_PATH}' could not be found automatically. Trying to load directly.")
-    print(f"Ensure '{LIB_RKLLM_PATH}' is in your LD_LIBRARY_PATH or provide an absolute path if loading fails.")
+LIB_RKLLM_PATH = './src/librkllmrt.so'
+rkllm = ctypes.CDLL(LIB_RKLLM_PATH)
 
-try:
-    rkllm = ctypes.CDLL(LIB_RKLLM_PATH)
-    print(f"Successfully loaded RKLLM library from '{LIB_RKLLM_PATH}'")
-except OSError as e:
-    print(f"Error loading RKLLM library from '{LIB_RKLLM_PATH}': {e}")
-    print("Please ensure the library path is correct, it's for aarch64 architecture, and all dependencies are met.")
-    exit(1)
 
 # --- Constants from rkllm.h (inferred from PDF) ---
 # LLMCallState (Page 2)
@@ -153,9 +105,9 @@ def python_llm_callback(result_ptr, userdata, state):
             except Exception as e:
                 print(f"[Callback Error decoding text: {e}]", end="", flush=True)
     elif state == LLM_RUN_FINISH:
-        print("\n<LLM_RUN_FINISH>")
+        pass
     elif state == LLM_RUN_ERROR:
-        print("\n<LLM_RUN_ERROR>")
+        pass
     elif state == LLM_RUN_WAITING:
         pass 
 
@@ -204,6 +156,8 @@ def run_inference():
 
     print("Initializing RKLLM model...")
     ret = rkllm.rkllm_init(ctypes.byref(llm_handle), ctypes.byref(param), python_llm_callback)
+    # ret = rkllm.rkllm_run(model_instance.llm_handle, ctypes.byref(rkllm_input), 
+                          # ctypes.byref(rkllm_infer_params), global_callback)
     if ret != 0:
         print(f"Error: rkllm_init failed with code {ret}")
         return
