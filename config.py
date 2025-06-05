@@ -4,7 +4,7 @@ This file centralizes all configurable parameters to make them easier to manage.
 """
 
 # Model Configuration
-MODEL_PATH = "../model/Gemma3-1B-w8a8-opt1.rkllm"
+MODEL_PATH = "../model/Qwen3-0.6B-w8a8-opt1-hybrid1-npu3.rkllm"
 LIBRARY_PATH = "./src/librkllmrt.so"  # Path to the RKLLM runtime library
 
 # Server Configuration
