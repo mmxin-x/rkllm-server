@@ -1,84 +1,149 @@
-# rkllm-just-works
+# RKLLM Server
 
-A set of simple Python scripts to run RKLLM (Rockchip Large Language Model) with OpenAI-compatible API, verified on rk3588, RKNPU v0.9.6, and RKLLM v1.2.0.
+An OpenAI-compatible API server for running RKLLM (Rockchip Large Language Model) models on RK3588 platform.
 
 ![space](assets/space.png)
-
 
 ---
 
 ## Project Goal
 
-A simple server to inference RKLLM models, with memory built-in in the server lifetime.
+A modular and well-structured server to run inference on RKLLM models, with proper support for:
+- OpenAI-compatible API endpoints
+- Tool/Function calling
+- Streaming and non-streaming responses
+- Conversation history management
+- WebUI integration
 
 ## Repository Structure
 
-- `server.py` / `server_memory.py`  
-  Main Flask server scripts exposing an OpenAI-compatible chat API powered by RKLLM. Handles model initialization, chat history, and streaming responses.
+This project follows a modern Python package structure:
 
-- `convo.py`  
-  Low-level Python interface for RKLLM inference using ctypes. Useful for direct invocation and testing.
+- `rkllm/` - Main package directory
+  - `__init__.py` - Package initialization
+  - `app.py` - Flask application setup and server initialization
+  - `config.py` - Centralized configuration module
+  - `api/` - API endpoint implementations
+    - `routes.py` - OpenAI-compatible API routes
+  - `lib/` - Library interface code
+    - `rkllm_runtime.py` - Low-level interface to RKLLM native library
+  - `utils/` - Utility functions and helpers
+    - `tool_calling.py` - Tool/function calling utilities
+    - `conversation.py` - Conversation history management
 
-- `client.py`  
-  Simple HTTP client to interact with the running RKLLM server via API calls.
+- `main.py` - Main entry point to start the server
 
-- `lite.py`  
-  Minimal example using the OpenAI Python SDK to connect to the local RKLLM server.
+- `tests/` - Test scripts
+  - `simple_tool_test.py` - Basic tool calling test
+  - `test_tool_calling.py` - Comprehensive tool calling tests
+  - `test_normal_chat.py` - Regular chat functionality tests
 
-- `reference/`  
-  Reference implementations and demos:
-  - `flask_server.py`: Full-featured Flask server example with multi-user support and advanced callback handling.
-  - `chat_api_flask.py`: Example Python client for sending chat requests to the server, including streaming and non-streaming modes.
-  - `llm_demo.cpp`: C++ demo for direct inference with RKLLM.
-  
-- `assets/`  
-  Images and other static resources (e.g., `space.png` for README illustration).
-
-- `LICENSE`  
-  Apache 2.0 license for usage and distribution.
+- `client.py` - Client script for interacting with the server
+- `reference/` - Reference materials and documentation
+- `assets/` - Images and other static resources
+- `src/` - Native libraries folder containing `librkllmrt.so`
 
 ---
 
 ## Usage
 
 1. **Download an RKLLM model**  
-   Obtain your `.bin` or other RKLLM-compatible model file.
+   Obtain your `.rkllm` model file.
 
 2. **Place the model file**  
-   Put your model (e.g., `Qwen3-0.6B-RKLLM.rkllm`) in a directory of your choice, for example:
+   Put your model (e.g., `Qwen3-0.6B-w8a8-opt1-hybrid1-npu3.rkllm`) in a directory, for example:
    ```
-   ./models/Qwen3-0.6B-RKLLM.rkllm
+   ../model/Qwen3-0.6B-w8a8-opt1-hybrid1-npu3.rkllm
    ```
 
-3. **Edit the server scripts to point to your model**  
-   In `server.py` or `server_memory.py`, set the `model_path` parameter to the correct path, such as:
-   ```python
-   MODEL_PATH = "./models/Qwen3-0.6B-RKLLM.bin"
+3. **Set up environment variables (optional)**  
+   You can configure the server using environment variables. For example:
+   ```bash
+   export RKLLM_MODEL_PATH="../model/Qwen3-0.6B-w8a8-opt1-hybrid1-npu3.rkllm"
+   export RKLLM_SERVER_PORT=1306
    ```
+   Alternatively, edit the configuration in `rkllm/config.py`.
 
 4. **Start the server**  
-   Run the server:
-   ```
-   python3 server.py
-   ```
-   or (for persistent memory version)
-   ```
-   python3 server_memory.py
+   Run the server using the new entry point:
+   ```bash
+   python3 main.py
    ```
 
-5. **Interact with the server**  
-   - Use `client.py` or `lite.py` to send requests.
-   - For OpenAI SDK compatibility, set your `base_url` to `http://0.0.0.0:1306/v1`.
-
-6. **Example using the client:**
+5. **Test the server**  
+   Run one of the test scripts to verify functionality:
+   ```bash
+   # Test basic tool calling
+   python3 tests/simple_tool_test.py
+   
+   # Test comprehensive tool calling features
+   python3 tests/test_tool_calling.py
+   
+   # Test regular chat functionality
+   python3 tests/test_normal_chat.py
    ```
-   python3 client.py
-   ```
 
-**Note:**  
-- Make sure `librkllmrt.so` (the RKLLM runtime) is present in `./src/` or update the path in the scripts.
-- If using custom models or multiple models, adjust the `model_path` and related parameters accordingly.
+6. **Use the API**  
+   - The server exposes OpenAI-compatible endpoints at `http://0.0.0.0:1306/v1`
+   - Use with any OpenAI client by setting the `base_url` to this address
+   - Key endpoints:
+     - `POST /v1/chat/completions` - Chat completions API
+     - `GET /v1/models` - List available models
+     
+**Implementation Notes:**
+- The simplified server (`simple_server.py`) provides the stability of the original implementation while fitting into the new modular structure
+- Tool calling and function execution are fully supported in the simplified bridge implementation
+- The fully modularized version is still under development
+
+**Notes:**  
+- Make sure `librkllmrt.so` (the RKLLM runtime) is present in `./src/` or update the library path in the configuration.
+- For custom models, adjust the model path in the configuration.
+- The server supports both streaming and non-streaming modes.
+- Tool/function calling is fully supported with the Qwen3 model.
 - [Model Collection](https://huggingface.co/collections/ThomasTheMaker/rkllm-v120-681974c057d4de18fb38be6c)
+
+## Advanced Features
+
+### Tool Calling
+The server supports OpenAI-compatible function/tool calling with Qwen3 models. To use tool calling:
+
+```python
+import requests
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate",
+            "description": "Calculate a mathematical expression",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "The mathematical expression to calculate"
+                    }
+                },
+                "required": ["expression"]
+            }
+        }
+    }
+]
+
+response = requests.post(
+    "http://localhost:1306/v1/chat/completions",
+    json={
+        "model": "gpt-3.5-turbo",  # Model name is ignored by the server
+        "messages": [
+            {"role": "user", "content": "Calculate 123 + 456"}
+        ],
+        "tools": tools,
+        "stream": False
+    }
+)
+
+print(response.json())
+```
 
 ---
 
