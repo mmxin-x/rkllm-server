@@ -5,6 +5,7 @@ import json
 import uuid
 import threading
 import queue # For thread-safe queue
+import re # For regex matching in tool calls
 from flask import Flask, request, Response, jsonify, stream_with_context
 
 # Import settings from config.py
@@ -17,6 +18,7 @@ rkllm_params_global = None
 model_initialized = False
 conversation_history_bytes = b""
 current_assistant_response_parts = [] 
+current_tool_calls = [] # Store parsed tool calls
 
 rkllm_lock = threading.Lock() # Lock for critical RKLLM sections and shared state
 
@@ -47,9 +49,100 @@ DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
 
 stream_token_queue = queue.Queue()
 
+# --- Tool Calling Utilities ---
+def try_parse_tool_calls(content):
+    """
+    Parse tool calls from model output using regex pattern for Qwen3 format.
+    Returns a dictionary with parsed tool calls if found.
+    """
+    try:
+        tool_calls = []
+        offset = 0
+        
+        # Look for tool calls in the <tool_call>...</tool_call> format
+        for i, m in enumerate(re.finditer(r"<tool_call>\n(.+?)?\n</tool_call>", content, re.DOTALL)):
+            if i == 0:
+                offset = m.start()
+            
+            try:
+                # Parse the JSON content inside tool_call tags
+                func_text = m.group(1).strip()
+                func = json.loads(func_text)
+                
+                # Ensure the function has required fields
+                if not func.get("name"):
+                    print(f"Warning: Tool call missing 'name' field: {func_text}")
+                    continue
+                    
+                if isinstance(func.get("arguments", ""), str):
+                    # Convert arguments string to dict if it's a valid JSON string
+                    try:
+                        args_text = func["arguments"].strip()
+                        # Handle empty arguments
+                        if not args_text:
+                            func["arguments"] = {}
+                        else:
+                            try:
+                                func["arguments"] = json.loads(args_text)
+                            except json.JSONDecodeError:
+                                # If not valid JSON, keep as string but log warning
+                                print(f"Warning: Invalid JSON in arguments: {args_text}")
+                    except Exception as e:
+                        print(f"Error processing arguments: {e}")
+                        func["arguments"] = {}
+                        
+                tool_calls.append({
+                    "index": i,
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "function", 
+                    "function": {
+                        "name": func.get("name", ""),
+                        "arguments": func.get("arguments", {})
+                    }
+                })
+            except json.JSONDecodeError as e:
+                print(f"Failed to parse tool call: {m.group(1)}\nError: {e}")
+            except Exception as e:
+                print(f"Unexpected error parsing tool call: {e}")
+        
+        # If tool calls were found
+        if tool_calls:
+            # Extract any content before the first tool call
+            content_before_tools = ""
+            if offset > 0 and content[:offset].strip():
+                content_before_tools = content[:offset].strip()
+            
+            return {"content": content_before_tools, "tool_calls": tool_calls}
+        
+        # If no tool calls, just return the cleaned content
+        return {"content": re.sub(r"<\|im_end\|>$", "", content)}
+    except Exception as e:
+        print(f"Error in try_parse_tool_calls: {e}")
+        # In case of any error, return the original content to avoid crashes
+        return {"content": content}
+
+def format_tool_calls_for_response(tool_calls):
+    """
+    Format tool calls for the OpenAI API response format
+    """
+    formatted_tool_calls = []
+    
+    for call in tool_calls:
+        formatted_call = {
+            "id": call["id"],
+            "type": call["type"],
+            "function": {
+                "name": call["function"]["name"],
+                "arguments": json.dumps(call["function"]["arguments"])
+            }
+        }
+        formatted_tool_calls.append(formatted_call)
+    
+    return formatted_tool_calls
+
 @LLMResultCallback
 def api_llm_callback(result_ptr, userdata, state):
-    global current_assistant_response_parts, stream_token_queue
+    global current_assistant_response_parts, stream_token_queue, current_tool_calls
     # print(f"[Callback {threading.get_ident()}] State: {state}, Qsize: {stream_token_queue.qsize()}")
     if not result_ptr:
         stream_token_queue.put(None) 
@@ -144,6 +237,34 @@ def format_openai_error_response(message, err_type="invalid_request_error", para
     if code: error_obj["error"]["code"] = code
     return jsonify(error_obj)
 
+@app.route('/v1/models', methods=['GET'])
+def list_models():
+    """Return available models with their capabilities"""
+    if not model_initialized:
+        return format_openai_error_response("RKLLM model not initialized.", "api_error"), 500
+    
+    model_name = rkllm_params_global.model_path.decode().split('/')[-1] if rkllm_params_global else "rkllm_model"
+    
+    # Return models with capabilities, including tool_calling
+    models = {
+        "object": "list",
+        "data": [
+            {
+                "id": model_name,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "user",
+                "permission": [],
+                "root": model_name,
+                "parent": None,
+                "capabilities": {
+                    "tool_calling": True  # Indicate that this model supports tool calling
+                }
+            }
+        ]
+    }
+    return jsonify(models)
+
 # --- Worker function to run RKLLM inference in a separate thread ---
 def rkllm_inference_worker(handle, input_obj_ptr, infer_params_obj_ptr):
     """
@@ -163,7 +284,7 @@ def rkllm_inference_worker(handle, input_obj_ptr, infer_params_obj_ptr):
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def chat_completions_handler():
-    global conversation_history_bytes, current_assistant_response_parts, rkllm_params_global, llm_handle, rkllm_lib, stream_token_queue
+    global conversation_history_bytes, current_assistant_response_parts, current_tool_calls, rkllm_params_global, llm_handle, rkllm_lib, stream_token_queue
     
     if not model_initialized: return format_openai_error_response("RKLLM model not initialized.", "api_error"), 500
     try: request_data = request.get_json()
@@ -173,13 +294,106 @@ def chat_completions_handler():
     messages = request_data.get("messages", [])
     stream_requested = request_data.get("stream", False)
     
+    # Extract tool/function data from the request
+    tools = request_data.get("tools", [])
+    functions = request_data.get("functions", [])
+    # If both tools and functions provided, tools take precedence per OpenAI API specification
+    function_call = request_data.get("function_call", None)
+    tool_choice = request_data.get("tool_choice", None)
+    
+    # Convert functions to tools format if provided (backward compatibility)
+    if not tools and functions:
+        tools = [{"type": "function", "function": func} for func in functions]
+    
     if not messages or messages[-1].get("role") != "user": return format_openai_error_response("Last message must be 'user'.", "invalid_request_error", param="messages"), 400
     last_user_message_content = messages[-1].get("content", "")
     if not last_user_message_content.strip(): return format_openai_error_response("User content is empty.", "invalid_request_error", param="messages.content"), 400
 
     # rkllm_lock ensures that context management, rkllm_run call, and history updates are atomic per request.
     with rkllm_lock: 
+        # Clear any previous tool calls
+        current_tool_calls.clear()
+        
+        # Format the user message
         current_user_turn_bytes = USER_TURN_START + last_user_message_content.encode('utf-8') + USER_TURN_END
+
+        # Initialize system message before any modifications
+        system_message = DEFAULT_SYSTEM_MESSAGE
+
+        # Custom system message in request
+        if "system" in request_data and request_data["system"]:
+            system_message = request_data["system"]
+
+        # If tools are provided, add them to the system prompt
+        if tools or functions:
+            try:
+                # Prefer tools over functions if both are provided (tools is the newer format)
+                tools_to_use = tools if tools else []
+                
+                # Convert functions to tools if provided (backward compatibility)
+                if functions:
+                    for func in functions:
+                        tools_to_use.append({
+                            "type": "function",
+                            "function": func
+                        })
+                
+                # Create a more structured but simpler tools description for the model
+                tools_info = "Available tools:\n"
+                for i, tool in enumerate(tools_to_use):
+                    try:
+                        if tool["type"] == "function":
+                            func = tool["function"]
+                            func_name = func.get("name", f"unnamed_function_{i}")
+                            func_desc = func.get("description", "No description provided")
+                            
+                            # Add function name and description
+                            tools_info += f"\n{i+1}. {func_name}: {func_desc}"
+                            
+                            # Add parameters in a simpler format
+                            if "parameters" in func:
+                                tools_info += "\n   Parameters:"
+                                
+                                # Add required parameters if specified
+                                if "required" in func["parameters"]:
+                                    tools_info += f"\n   - Required: {', '.join(func['parameters'].get('required', []))}"
+                                
+                                # Add properties in a simplified way
+                                if "properties" in func["parameters"]:
+                                    for param_name, param in func["parameters"]["properties"].items():
+                                        param_type = param.get("type", "any")
+                                        param_desc = param.get("description", "")
+                                        tools_info += f"\n   - {param_name} ({param_type}): {param_desc}"
+                    except Exception as e:
+                        print(f"Error processing tool {i}: {e}")
+                        continue
+
+                # Add tools information to the system message
+                tools_info += "\n\nWhen using a tool, use the exact format:\n<tool_call>\n{\"name\": \"function_name\", \"arguments\": {\"param1\": \"value1\", \"param2\": \"value2\"}}\n</tool_call>\n"
+                
+                # Append tools info to system message
+                system_message = system_message + "\n\n" + tools_info
+
+                # Handle tool_choice if provided (simplified)
+                if "tool_choice" in request_data or "function_call" in request_data:
+                    # Prefer tool_choice over function_call if both are provided
+                    tool_choice = request_data.get("tool_choice", request_data.get("function_call", None))
+                    if tool_choice:
+                        # Extract just the function name for a simpler instruction
+                        if isinstance(tool_choice, dict):
+                            if tool_choice.get("type") == "function" and "function" in tool_choice:
+                                func_name = tool_choice["function"].get("name", "")
+                                if func_name:
+                                    system_message += f"\n\nYou MUST use the {func_name} tool for this request."
+            except Exception as e:
+                print(f"Error adding tools to system prompt: {e}")
+                # Continue without tools if there's an error
+        
+        # Format system prompt
+        if system_message:
+            system_prompt_bytes = SYS_PROMPT_TEMPLATE.replace(b"{system_message}", system_message.encode('utf-8'))
+            conversation_history_bytes = system_prompt_bytes + conversation_history_bytes
+        
         prompt_for_llm = conversation_history_bytes + current_user_turn_bytes + ASSISTANT_TURN_START
         
         EFFECTIVE_PROMPT_TOKEN_LIMIT = 500 
@@ -234,10 +448,14 @@ def chat_completions_handler():
             # It proceeds to return the streaming response.
 
             def generate_stream_response_sse():
-                global conversation_history_bytes # To update after stream
+                global conversation_history_bytes, current_tool_calls # To update after stream
                 
                 print(f"[Stream SSE Gen {threading.get_ident()}] Starting generator. Timestamp: {time.time()}")
                 streamed_response_for_history_update = [] 
+                accumulated_text = ""
+                tool_call_detected = False
+                first_content_chunk_sent = False
+                
                 try:
                     while True:
                         try:
@@ -252,13 +470,115 @@ def chat_completions_handler():
                         
                         if token_or_signal == "__LLM_RUN_FINISH__":
                             print(f"[Stream SSE Gen {threading.get_ident()}] Received FINISH signal. Timestamp: {time.time()}")
-                            final_chunk = {"id": request_id, "object": "chat.completion.chunk", "created": created_ts, "model": model_name_to_return, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                            
+                            # Check the accumulated text for tool calls at the end
+                            if accumulated_text:
+                                parsed_response = try_parse_tool_calls(accumulated_text)
+                                if "tool_calls" in parsed_response:
+                                    # We found tool calls in the final response
+                                    tool_call_detected = True
+                                    current_tool_calls = parsed_response["tool_calls"]
+                                    
+                                    # Send the tool calls as deltas
+                                    for i, tool_call in enumerate(current_tool_calls):
+                                        formatted_call = {
+                                            "id": tool_call["id"],
+                                            "type": tool_call["type"],
+                                            "function": {
+                                                "name": tool_call["function"]["name"],
+                                                "arguments": json.dumps(tool_call["function"]["arguments"])
+                                            }
+                                        }
+                                        
+                                        # For the first tool call, set content to empty string if we haven't sent content yet
+                                        if i == 0 and not first_content_chunk_sent:
+                                            chunk = {
+                                                "id": request_id, 
+                                                "object": "chat.completion.chunk", 
+                                                "created": created_ts, 
+                                                "model": model_name_to_return, 
+                                                "choices": [
+                                                    {
+                                                        "index": 0, 
+                                                        "delta": {
+                                                            "role": "assistant",
+                                                            "content": parsed_response.get("content", "")
+                                                        },
+                                                        "finish_reason": None
+                                                    }
+                                                ]
+                                            }
+                                            yield f"data: {json.dumps(chunk)}\n\n"
+                                            first_content_chunk_sent = True
+                                        
+                                        # Send the tool call as a delta
+                                        chunk = {
+                                            "id": request_id, 
+                                            "object": "chat.completion.chunk", 
+                                            "created": created_ts, 
+                                            "model": model_name_to_return, 
+                                            "choices": [
+                                                {
+                                                    "index": 0, 
+                                                    "delta": {"tool_calls": [formatted_call]},
+                                                    "finish_reason": None
+                                                }
+                                            ]
+                                        }
+                                        yield f"data: {json.dumps(chunk)}\n\n"
+                            
+                            # Send the final chunk with the appropriate finish_reason
+                            finish_reason = "tool_calls" if tool_call_detected else "stop"
+                            final_chunk = {"id": request_id, "object": "chat.completion.chunk", "created": created_ts, "model": model_name_to_return, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]}
                             yield f"data: {json.dumps(final_chunk)}\n\n"
                             break
                         
                         streamed_response_for_history_update.append(token_or_signal) 
-                        chunk = {"id": request_id, "object": "chat.completion.chunk", "created": created_ts, "model": model_name_to_return, "choices": [{"index": 0, "delta": {"content": token_or_signal}, "finish_reason": None}]}
-                        yield f"data: {json.dumps(chunk)}\n\n"
+                        accumulated_text += token_or_signal
+                        
+                        # Only send content chunks if we haven't detected a tool call pattern yet
+                        if not tool_call_detected:
+                            # Check if we might have a complete tool call
+                            if "<tool_call>" in accumulated_text and "</tool_call>" in accumulated_text:
+                                # Potential tool call detected - parse the current text
+                                parsed = try_parse_tool_calls(accumulated_text)
+                                if "tool_calls" in parsed:
+                                    # We found tool calls - don't send more content after this
+                                    tool_call_detected = True
+                            
+                            # If no tool call detected yet, stream the token as content
+                            if not tool_call_detected:
+                                if not first_content_chunk_sent:
+                                    # First chunk needs to include the role
+                                    chunk = {
+                                        "id": request_id, 
+                                        "object": "chat.completion.chunk", 
+                                        "created": created_ts, 
+                                        "model": model_name_to_return, 
+                                        "choices": [
+                                            {
+                                                "index": 0, 
+                                                "delta": {"role": "assistant", "content": token_or_signal},
+                                                "finish_reason": None
+                                            }
+                                        ]
+                                    }
+                                    first_content_chunk_sent = True
+                                else:
+                                    chunk = {
+                                        "id": request_id, 
+                                        "object": "chat.completion.chunk", 
+                                        "created": created_ts, 
+                                        "model": model_name_to_return, 
+                                        "choices": [
+                                            {
+                                                "index": 0, 
+                                                "delta": {"content": token_or_signal},
+                                                "finish_reason": None
+                                            }
+                                        ]
+                                    }
+                                yield f"data: {json.dumps(chunk)}\n\n"
                         # time.sleep(0.005) # Minimal sleep to allow other threads, if any, to process. Can make streaming more "visible".
                 
                 except Exception as e_stream:
@@ -291,10 +611,23 @@ def chat_completions_handler():
                     # Now that worker is done (or timed out), current_assistant_response_parts should be stable.
                     # The lock is still held by the main request handler.
                     full_response_this_turn = "".join(current_assistant_response_parts) # These parts were for this turn
-                    if full_response_this_turn: 
-                        new_segment = current_user_turn_bytes + ASSISTANT_TURN_START + full_response_this_turn.encode('utf-8') + ASSISTANT_TURN_END
+                    if full_response_this_turn:
+                        # Check if there were any tool calls in the response
+                        if current_tool_calls:
+                            # We had tool calls - only store the content part in history
+                            parsed_response = try_parse_tool_calls(full_response_this_turn)
+                            # Extract only the content part (without the tool calls)
+                            content_for_history = parsed_response.get("content", "")
+                            new_segment = current_user_turn_bytes + ASSISTANT_TURN_START + content_for_history.encode('utf-8') + ASSISTANT_TURN_END
+                        else:
+                            # No tool calls - store the full response
+                            new_segment = current_user_turn_bytes + ASSISTANT_TURN_START + full_response_this_turn.encode('utf-8') + ASSISTANT_TURN_END
+                        
                         conversation_history_bytes += new_segment
-                        print(f"[API History Update after stream generation] History bytes: {len(conversation_history_bytes)}")
+                        print(f"[API History Update after stream generation] History bytes: {len(conversation_history_bytes)}, Had tool calls: {bool(current_tool_calls)}")
+                        
+                        # Clear the tool calls list after processing
+                        current_tool_calls.clear()
 
 
             return Response(stream_with_context(generate_stream_response_sse()), mimetype='text/event-stream')
@@ -311,13 +644,74 @@ def chat_completions_handler():
                 return format_openai_error_response(f"RKLLM run failed (code: {run_ret}).", "api_error"), 500
 
             full_assistant_response_str = "".join(current_assistant_response_parts)
-            if run_ret == 0: 
-                new_segment = current_user_turn_bytes + ASSISTANT_TURN_START + full_assistant_response_str.encode('utf-8') + ASSISTANT_TURN_END
-                conversation_history_bytes += new_segment
-
+            
+            # For non-streaming mode, we collected the complete assistant response in current_assistant_response_parts
+            try:
+                full_response = "".join(current_assistant_response_parts)
+                
+                # Check for tool calls in response
+                parsed_response = try_parse_tool_calls(full_response)
+                
+                # Create the chat completion message from assistant
+                assistant_message = {
+                    "role": "assistant",
+                    "content": parsed_response.get("content", full_response)
+                }
+                
+                # Add tool calls to message if present
+                finish_reason = "stop"
+                if "tool_calls" in parsed_response and parsed_response["tool_calls"]:
+                    try:
+                        current_tool_calls = parsed_response["tool_calls"] # Store for potential follow-up
+                        formatted_calls = format_tool_calls_for_response(parsed_response["tool_calls"])
+                        assistant_message["tool_calls"] = formatted_calls
+                        finish_reason = "tool_calls"
+                        
+                        # Debug
+                        print(f"Found tool calls: {len(current_tool_calls)}")
+                        for i, tool_call in enumerate(current_tool_calls):
+                            print(f"Tool call {i+1}: {tool_call['function'].get('name', 'unknown')}")
+                    except Exception as e:
+                        print(f"Error processing tool calls: {e}")
+            except Exception as e:
+                print(f"Error processing non-streaming response: {e}")
+                assistant_message = {
+                    "role": "assistant", 
+                    "content": full_response
+                }
+                finish_reason = "stop"
+                
+            # Update conversation history
+            if run_ret == 0:
+                try:
+                    # Only store the content part in history, without tool calls JSON
+                    if "tool_calls" in parsed_response and parsed_response["tool_calls"]:
+                        # Add just the text content to the history, not the tool call JSON
+                        response_for_history = parsed_response.get("content", "")
+                    else:
+                        # No tool calls, use the full response
+                        response_for_history = full_response
+                        
+                    # Add this turn to conversation history
+                    new_segment = current_user_turn_bytes + ASSISTANT_TURN_START + response_for_history.encode('utf-8') + ASSISTANT_TURN_END
+                    conversation_history_bytes += new_segment
+                    print(f"[API History Update] History bytes: {len(conversation_history_bytes)}")
+                except Exception as e:
+                    print(f"Error updating history: {e}")
+            
+            # Prepare the API response
             prompt_tokens_est = len(prompt_for_llm) // 4 
-            completion_tokens_est = len(full_assistant_response_str) // 4
-            response_json = {"id": request_id, "object": "chat.completion", "created": created_ts, "model": model_name_to_return, "choices": [{"index": 0, "message": {"role": "assistant", "content": full_assistant_response_str}, "finish_reason": "stop" }], "usage": {"prompt_tokens": prompt_tokens_est, "completion_tokens": completion_tokens_est, "total_tokens": prompt_tokens_est + completion_tokens_est}}
+            completion_tokens_est = len(full_response) // 4
+                
+            # Assemble the final API response
+            response_json = {
+                "id": request_id, 
+                "object": "chat.completion", 
+                "created": created_ts, 
+                "model": model_name_to_return, 
+                "choices": [{"index": 0, "message": assistant_message, "finish_reason": finish_reason}],
+                "usage": {"prompt_tokens": prompt_tokens_est, "completion_tokens": completion_tokens_est, "total_tokens": prompt_tokens_est + completion_tokens_est}
+            }
             return jsonify(response_json)
 
 # --- Main Entry Point ---
