@@ -218,11 +218,23 @@ def stop_generation():
             print("[Stop Generation] No active generation to stop")
             return False
             
-app.route('/v1/stop', methods=['POST'])
+@app.route('/v1/stop', methods=['POST'])
 def stop():
     success = stop_generation()
     return jsonify({'stopped':success})
     
+@app.route('/v1/clear', methods=['POST'])
+def newChat():
+    global conversation_history_bytes
+    try:
+        rkllm_lib.rkllm_clear_kv_cache(llm_handle,1)
+    except Exception as e:
+        return jsonify({'error':str(e)}),500
+    with rkllm_lock:
+        tpl = get_chat_template('default')
+        conversation_history_bytes = SYS_PROMPT_TEMPLATE.replace(b"{system_message}", DEFAULT_SYSTEM_MESSAGE.encode('utf-8'))
+        return jsonify({'cleared':True})
+        
 @LLMResultCallback
 def api_llm_callback(result_ptr, userdata, state):
     global current_assistant_response_parts, stream_token_queue, generation_stop_flag
